@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "softdtw-cuda-torch"
+version = "0.1.0"
+description = "SoftDTW with CUDA kernels (Numba) and PyTorch autograd"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Ron Shapira Weber", email = "ronsha@post.bgu.ac.il"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numba>=0.60",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/BGU-CS-VIL/sdtw-cuda-torch"
+Repository = "https://github.com/BGU-CS-VIL/sdtw-cuda-torch"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["softdtw_cuda*"]
