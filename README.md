@@ -35,8 +35,6 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 | **vs. Maghoumi memory** | — | 96.9% less | 98.0% less |
 | **vs. Maghoumi speed** | — | **67× faster** | 6.5× faster |
 
-> For N > 1024, Maghoumi fails entirely. This repo handles N=2048 and beyond.
-
 ### When to Use Each Mode
 
 | Scenario | Mode | Reason |
