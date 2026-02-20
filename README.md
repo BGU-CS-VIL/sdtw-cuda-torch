@@ -77,12 +77,6 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 ### Step 2 — Install this package
 
 ```bash
-pip install softdtw-cuda-torch
-```
-
-Or in editable mode for development:
-
-```bash
 git clone https://github.com/BGU-CS-VIL/sdtw-cuda-torch
 pip install -e sdtw-cuda-torch
 ```
