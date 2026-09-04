@@ -16,9 +16,13 @@ class SoftDTW(nn.Module):
     - dist: currently supports "sqeuclidean"
     - normalize: SoftDTW(x,y) - 0.5*(SoftDTW(x,x)+SoftDTW(y,y))
     - fused:
-        None  -> auto (use fused only when possible)
+        None  -> auto (fused when CUDA + sqeuclidean). NB: auto ignores D --
+                 fused recomputes the cost with an O(D) loop per DP cell, so for
+                 large D (e.g. foundation-model features) pass fused=False for
+                 much better speed.
         True  -> require fused (error if not possible)
-        False -> never fused (always materialize D and use D-based autograd)
+        False -> never fused: build the (B,N,M) cost with one bmm, then the
+                 D-based autograd. Same result; faster at large D; more memory.
     """
 
     def __init__(

@@ -1,0 +1,6 @@
+{
+  "device": "NVIDIA GeForce RTX 3090",
+  "torch": "2.6.0+cu124",
+  "cuda": "12.4",
+  "gamma": 1.0
+}

@@ -10,6 +10,7 @@ from .kernels import softdtw_forward_kernel, softdtw_forward_diag_cuda
 from .kernels import softdtw_backward_log_cuda, softdtw_backward_log_diag_cuda
 from .kernels import softdtw_forward_diag_sqeuclid_cuda
 from .kernels import softdtw_backward_log_diag_sqeuclid_cuda
+from .kernels import dtw_forward_diag_stream_sqeuclid_cuda, dtw_forward_diag_cuda
 
 # GLOBALS
 TPB_LONG = 256
@@ -85,6 +86,100 @@ def softdtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, gamma:
 
     out = R[:, -2, -2].contiguous()
     return out, R
+
+
+def dtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, bandwidth: float):
+    """Fused *hard* DTW forward for squared-euclidean distance (no D materialized).
+
+    Exact DTW (gamma->0 limit of soft-DTW): same anti-diagonal wavefront and
+    fused sqeuclidean cost as the soft-DTW fused forward, but the per-cell
+    aggregation is a true ``min``. Streams the DP over three rotating
+    anti-diagonal buffers, so peak memory is O(B * min(N, M)) -- neither the
+    (B, N, M) local-cost tensor nor a full (B, N, M) DP table is materialized.
+    Forward-only.
+
+    X: (B,N,D), Y: (B,M,D) CUDA tensors. Returns: out (B,) hard-DTW distances.
+    """
+    if not (X.is_cuda and Y.is_cuda):
+        raise ValueError("Expected CUDA tensors X and Y")
+    if X.dim() != 3 or Y.dim() != 3:
+        raise ValueError(f"Expected X,Y as (B,N,D)/(B,M,D). Got {tuple(X.shape)} and {tuple(Y.shape)}")
+    if X.shape[0] != Y.shape[0] or X.shape[2] != Y.shape[2]:
+        raise ValueError(f"Batch/features mismatch: {tuple(X.shape)} vs {tuple(Y.shape)}")
+
+    X_ = X.detach().contiguous()
+    Y_ = Y.detach().contiguous()
+
+    B, N, D = X_.shape
+    M = Y_.shape[1]
+
+    # DTW is symmetric; keep the buffer axis on the shorter sequence so peak
+    # memory is O(B * min(N, M)).
+    if N > M:
+        X_, Y_ = Y_, X_
+        N, M = M, N
+
+    X_ca = cuda.as_cuda_array(X_)
+    Y_ca = cuda.as_cuda_array(Y_)
+
+    # Three rotating anti-diagonals of length N (= min): prev2, prev1, curr.
+    # +inf init; the (0,0) corner is seeded with 0 inside the kernel.
+    bufs = [torch.full((B, N), math.inf, device=X_.device, dtype=X_.dtype)
+            for _ in range(3)]
+    a, b_, c = 0, 1, 2   # indices of prev2, prev1, curr
+
+    inv_bw = float(bandwidth)  # can be -1.0 to disable
+
+    for p in range(N + M - 1):
+        i_min = max(0, p - (M - 1))
+        i_max = min(N - 1, p)
+        diag_len = i_max - i_min + 1
+        grid_x = (diag_len + TPB_LONG - 1) // TPB_LONG
+
+        dtw_forward_diag_stream_sqeuclid_cuda[(grid_x, B), TPB_LONG](
+            X_ca, Y_ca,
+            cuda.as_cuda_array(bufs[a]),
+            cuda.as_cuda_array(bufs[b_]),
+            cuda.as_cuda_array(bufs[c]),
+            inv_bw, N, M, D, p,
+        )
+        a, b_, c = b_, c, a   # rotate: prev2<-prev1, prev1<-curr, curr<-old prev2
+
+    # After the final rotation the just-written last diagonal is in bufs[b_];
+    # the end cell (N-1, M-1) sits at index i = N-1.
+    return bufs[b_][:, N - 1].contiguous()
+
+
+def dtw_forward_cuda(D: torch.Tensor, bandwidth: float):
+    """D-based *hard* DTW forward (min recurrence, no gamma). Forward-only.
+
+    D: (B,N,M) CUDA tensor of local costs. Returns: out (B,) hard-DTW distances.
+    Uses the general tiled anti-diagonal path (valid for all N,M).
+    """
+    if not D.is_cuda:
+        raise ValueError("Expected CUDA tensor D")
+
+    D_ = D.detach().contiguous()
+    B, N, M = D_.shape
+
+    R = torch.full((B, N + 2, M + 2), math.inf, device=D_.device, dtype=D_.dtype)
+    R[:, 0, 0] = 0.0
+
+    D_ca = cuda.as_cuda_array(D_)
+    R_ca = cuda.as_cuda_array(R)
+
+    for p in range(N + M - 1):
+        i_min, i_max = _diag_bounds(p, N, M)
+        if i_max < i_min:
+            continue
+        diag_len = i_max - i_min + 1
+        grid_x = (diag_len + TPB_LONG - 1) // TPB_LONG
+
+        dtw_forward_diag_cuda[(grid_x, B), TPB_LONG](
+            D_ca, R_ca, float(bandwidth), N, M, p,
+        )
+
+    return R[:, -2, -2].contiguous()
 
 
 def softdtw_backward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor, gamma: float, bandwidth: float):
@@ -366,3 +461,33 @@ def softdtw_backward_cpu(D: torch.Tensor, R: torch.Tensor, gamma: float, bandwid
     R_np = R.detach().cpu().numpy().copy()  # .copy() prevents in-place mutation of saved autograd tensor
     E_np = _softdtw_backward_cpu_np(D_np, R_np, float(gamma), float(bandwidth))
     return torch.from_numpy(E_np).to(D.device).type_as(D).contiguous()
+
+
+# ---- Hard-DTW CPU reference (exact; runs without a GPU) ----
+
+@jit(nopython=True, parallel=True)
+def _dtw_forward_cpu_np(D: np.ndarray, bandwidth: float):
+    B, N, M = D.shape
+    R = np.ones((B, N + 2, M + 2), dtype=D.dtype) * np.inf
+    R[:, 0, 0] = 0.0
+    for b in prange(B):
+        for j in range(1, M + 1):
+            for i in range(1, N + 1):
+                if 0 < bandwidth < abs(i - j):
+                    continue
+                r0 = R[b, i - 1, j - 1]
+                r1 = R[b, i - 1, j]
+                r2 = R[b, i, j - 1]
+                m = r0
+                if r1 < m: m = r1
+                if r2 < m: m = r2
+                R[b, i, j] = D[b, i - 1, j - 1] + m
+    return R
+
+
+def dtw_forward_cpu(D: torch.Tensor, bandwidth: float):
+    """Exact hard-DTW forward on CPU (D: (B,N,M) local costs) -> out (B,)."""
+    D_np = D.detach().cpu().numpy()
+    R_np = _dtw_forward_cpu_np(D_np, float(bandwidth))
+    R = torch.from_numpy(R_np).to(D.device).type_as(D)
+    return R[:, -2, -2].contiguous()

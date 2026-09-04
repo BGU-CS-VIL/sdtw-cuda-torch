@@ -227,3 +227,166 @@ def softdtw_barycenter_cpu(
         patience=patience,
         tol=tol,
     )
+
+
+# ---------------------------------------------------------------------------
+# Classic DBA (DTW Barycenter Averaging) — exact DTW, Petitjean et al. 2011
+# ---------------------------------------------------------------------------
+
+import numpy as np
+from numba import njit
+
+from .distances import pairwise_distance
+
+
+@njit(cache=True)
+def _dba_iteration(D_all, X, w):
+    """One DBA pass: full DP + backtrack per series, weighted accumulation.
+
+    D_all: (B, T, N) float64 local cost (barycenter rows x series cols).
+    X:     (B, N, F) float64 series values.
+    w:     (B,) float64 weights.
+    Returns (sums (T,F), counts (T,), total_cost). Ties in the backtrack
+    prefer the diagonal (match), then insertion (i-1), then deletion (j-1).
+    """
+    B, T, N = D_all.shape
+    F = X.shape[2]
+    sums = np.zeros((T, F))
+    counts = np.zeros(T)
+    total = 0.0
+    R = np.empty((T + 1, N + 1))
+    for b in range(B):
+        R[:] = np.inf
+        R[0, 0] = 0.0
+        for i in range(1, T + 1):
+            for j in range(1, N + 1):
+                r0 = R[i - 1, j - 1]
+                r1 = R[i - 1, j]
+                r2 = R[i, j - 1]
+                rmin = r0
+                if r1 < rmin:
+                    rmin = r1
+                if r2 < rmin:
+                    rmin = r2
+                R[i, j] = D_all[b, i - 1, j - 1] + rmin
+        total += w[b] * R[T, N]
+        i, j = T, N
+        while True:
+            for f in range(F):
+                sums[i - 1, f] += w[b] * X[b, j - 1, f]
+            counts[i - 1] += w[b]
+            if i == 1 and j == 1:
+                break
+            if i == 1:
+                j -= 1
+                continue
+            if j == 1:
+                i -= 1
+                continue
+            r0 = R[i - 1, j - 1]
+            r1 = R[i - 1, j]
+            r2 = R[i, j - 1]
+            if r0 <= r1 and r0 <= r2:
+                i -= 1
+                j -= 1
+            elif r1 <= r2:
+                i -= 1
+            else:
+                j -= 1
+    return sums, counts, total
+
+
+def dtw_barycenter(
+    X: torch.Tensor,
+    *,
+    max_iter: int = 30,
+    tol: float = 1e-5,
+    weights: torch.Tensor | None = None,
+    init: torch.Tensor | None = None,
+    bandwidth: float | None = None,
+    device: str | torch.device | None = None,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Classic DBA (DTW Barycenter Averaging; Petitjean et al., 2011) under
+    exact DTW — the hard counterpart of :func:`softdtw_barycenter`.
+
+    Alternates (1) exact-DTW alignment of every series to the current
+    barycenter and (2) per-index weighted arithmetic mean of the aligned
+    values, until the total DTW cost stops improving. The local cost is fixed
+    to squared euclidean: the arithmetic-mean update is the exact minimizer
+    of the alignment objective only under that cost.
+
+    Unlike :func:`softdtw_barycenter` (gradient descent, differentiable),
+    DBA is a fixed-point scheme on hard alignments: monotonically
+    non-increasing total cost, no learning rate, no gamma.
+
+    Implementation: local-cost matrices are computed with torch on `device`
+    (GPU-capable, the O(B*T*N*F) part); the sequential DP + backtrack runs in
+    a numba-jitted CPU loop (float64). The DP materializes one (T+1, N+1)
+    matrix at a time — DBA needs the full matrix for backtracking, so the
+    fused flat-memory kernel of :class:`DTW` does not apply here.
+
+    Args:
+        X: (B, N, F) series (equal lengths).
+        max_iter: maximum DBA iterations.
+        tol: relative total-cost improvement below which to stop.
+        weights: (B,) nonnegative per-series weights (default: uniform).
+        init: (T, F) initial barycenter (default: weighted Euclidean mean,
+            T = N). Its length T sets the barycenter length.
+        bandwidth: Sakoe-Chiba band on |i - j·T/N| (None disables).
+        device: where the cost matrices are computed (default: X.device).
+        verbose: print per-iteration total cost.
+
+    Returns:
+        (T, F) barycenter, on X's original device and dtype.
+    """
+    if X.dim() != 3:
+        raise ValueError(f"Expected X of shape (B, N, F). Got {tuple(X.shape)}")
+    B, N, F = X.shape
+    if B == 0 or N == 0:
+        raise ValueError(f"Empty input: B={B}, N={N}.")
+    out_device, out_dtype = X.device, X.dtype
+    dev = torch.device(device) if device is not None else X.device
+    Xd = X.detach().to(dev, dtype=torch.float32)
+
+    if weights is None:
+        w = torch.ones(B, dtype=torch.float64)
+    else:
+        w = weights.detach().to("cpu", dtype=torch.float64).reshape(-1)
+        if w.numel() != B:
+            raise ValueError(f"weights must have {B} entries. Got {w.numel()}.")
+        if (w < 0).any() or w.sum() <= 0:
+            raise ValueError("weights must be nonnegative with positive sum.")
+    w_np = w.numpy()
+    w_dev = w.to(dev, dtype=torch.float32)
+
+    if init is None:
+        mu = (Xd * w_dev[:, None, None]).sum(0) / w_dev.sum()          # (N, F)
+    else:
+        if init.dim() != 2 or init.shape[1] != F:
+            raise ValueError(f"init must be (T, {F}). Got {tuple(init.shape)}")
+        mu = init.detach().to(dev, dtype=torch.float32).clone()
+    T = mu.shape[0]
+
+    band_mask = None
+    if bandwidth is not None and bandwidth > 0:
+        ii = torch.arange(T, device=dev, dtype=torch.float32)[:, None]
+        jj = torch.arange(N, device=dev, dtype=torch.float32)[None, :]
+        band_mask = (ii - jj * (T / max(N, 1))).abs() > float(bandwidth)  # (T, N)
+
+    X_np = Xd.to("cpu", dtype=torch.float64).numpy()
+    prev_total = float("inf")
+    for it in range(max_iter):
+        D_all = pairwise_distance(mu.unsqueeze(0).expand(B, -1, -1), Xd,
+                                  dist="sqeuclidean")                  # (B, T, N)
+        if band_mask is not None:
+            D_all = D_all.masked_fill(band_mask, float("inf"))
+        D_np = D_all.to("cpu", dtype=torch.float64).numpy()
+        sums, counts, total = _dba_iteration(D_np, X_np, w_np)
+        if verbose:
+            print(f"[dba] iter {it:3d}  total_cost={total:.6f}")
+        mu = torch.from_numpy(sums / counts[:, None]).to(dev, dtype=torch.float32)
+        if prev_total - total <= tol * max(abs(prev_total), 1.0):
+            break
+        prev_total = total
+    return mu.to(out_device, dtype=out_dtype)
