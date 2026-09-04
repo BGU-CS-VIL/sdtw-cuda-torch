@@ -28,8 +28,28 @@ def sqeuclidean(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return D.clamp_min(0.0)
 
 
+def cosine_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Per-timestep cosine distance: D[b,i,j] = 1 - cosine_similarity(x[b,i], y[b,j]).
+
+    Values are in [0, 2]. Use as SoftDTW cost to maximise soft cosine alignment.
+
+    x: (B,N,D), y: (B,M,D)
+    returns: (B,N,M)
+    """
+    if x.dim() != 3 or y.dim() != 3:
+        raise ValueError(f"Expected x,y as (B,N,D)/(B,M,D). Got {tuple(x.shape)} and {tuple(y.shape)}")
+    if x.shape[0] != y.shape[0] or x.shape[2] != y.shape[2]:
+        raise ValueError(f"Batch/features mismatch: {tuple(x.shape)} vs {tuple(y.shape)}")
+
+    x_n = x / (x.norm(dim=-1, keepdim=True) + 1e-12)
+    y_n = y / (y.norm(dim=-1, keepdim=True) + 1e-12)
+    return 1.0 - torch.bmm(x_n, y_n.transpose(1, 2))
+
+
 def pairwise_distance(x: torch.Tensor, y: torch.Tensor, *, dist: str) -> torch.Tensor:
     dist = dist.lower()
     if dist in ("sqeuclidean", "sq_euclidean", "squared_euclidean"):
         return sqeuclidean(x, y)
-    raise ValueError(f"Unknown dist='{dist}'. Supported: 'sqeuclidean'")
+    if dist == "cosine":
+        return cosine_distance(x, y)
+    raise ValueError(f"Unknown dist='{dist}'. Supported: 'sqeuclidean', 'cosine'")

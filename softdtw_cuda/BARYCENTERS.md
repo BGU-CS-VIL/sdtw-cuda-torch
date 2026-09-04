@@ -257,3 +257,28 @@ If you use this implementation in research, please cite:
   year={2017}
 }
 ```
+
+## Classic DBA (`dtw_barycenter()`)
+
+The hard counterpart of `softdtw_barycenter`: classic **DTW Barycenter
+Averaging** (Petitjean et al., 2011) under *exact* DTW. Alternates exact-DTW
+alignment of every series to the current barycenter with a per-index weighted
+arithmetic mean of the aligned values — a fixed-point scheme with monotonically
+non-increasing total cost, no learning rate and no gamma. Local cost is fixed
+to squared euclidean (the mean update is exactly optimal only under it).
+
+```python
+from softdtw_cuda import dtw_barycenter
+
+X = torch.randn(10, 100, 3)                 # (B, N, F), equal lengths
+mu = dtw_barycenter(X, max_iter=30)         # (100, 3)
+mu = dtw_barycenter(X, weights=w, init=m0,  # optional: weights (B,),
+                    bandwidth=10)           # init (T, F), Sakoe-Chiba band
+```
+
+Cost matrices are computed with torch on `device` (GPU-capable); the
+sequential DP + backtrack runs in a numba-jitted CPU loop in float64. DBA
+needs the full DP matrix for backtracking, so the flat-memory fused kernel of
+`DTW` does not apply — one `(T+1, N+1)` matrix is materialized at a time.
+Backtrack ties prefer diagonal, then `i-1`, then `j-1`. Validated against
+`tslearn.barycenters.dtw_barycenter_averaging` (see `tests/test_dba.py`).

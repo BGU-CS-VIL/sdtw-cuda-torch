@@ -1,4 +1,5 @@
 import torch
+from torch.autograd import gradcheck
 from softdtw_cuda import SoftDTW
 
 def test_softdtw_cpu_runs():
@@ -27,11 +28,10 @@ def test_softdtw_cuda_matches_cpu_small():
     assert torch.allclose(out_cpu, out_gpu, atol=1e-4, rtol=1e-4)
 
 def test_gradcheck_tiny():
-    # gradcheck needs double
+    # A real finite-difference gradient check (float64). See test_gradcheck.py for
+    # the full edge-shape matrix; this is the minimal smoke version.
     torch.manual_seed(0)
     x = torch.randn(1, 6, 2, dtype=torch.float64, requires_grad=True)
-    y = torch.randn(1, 5, 2, dtype=torch.float64)
+    y = torch.randn(1, 5, 2, dtype=torch.float64, requires_grad=True)
     sdtw = SoftDTW(gamma=1.0, dist="sqeuclidean")
-    out = sdtw(x, y)
-    (out.sum()).backward()
-    assert torch.isfinite(x.grad).all()
+    assert gradcheck(lambda a, b: sdtw(a, b), (x, y), eps=1e-6, atol=1e-5, rtol=1e-3)

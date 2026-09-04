@@ -47,6 +47,61 @@ def softdtw_forward_diag_sqeuclid_cuda(X, Y, R, gamma, bandwidth, N, M, D, p):
 
 
 @cuda.jit
+def dtw_forward_diag_stream_sqeuclid_cuda(X, Y, prev2, prev1, curr, bandwidth, N, M, D, p):
+    """Fused *hard* DTW forward, streaming: one anti-diagonal per launch over
+    three rotating 1-D buffers -> O(min(N, M)) memory (no (N, M) DP table).
+
+    Cells on anti-diagonal ``p = i + j`` depend only on diagonals ``p-1`` and
+    ``p-2``, so ``prev1``/``prev2`` hold those two and ``curr`` receives this
+    one; the host rotates the three buffers after each launch. Buffers are
+    indexed by absolute ``i`` and have length ``N`` (the caller ensures
+    ``N <= M`` via ``DTW(x, y) == DTW(y, x)``). The aggregation is a true
+    ``min`` and there is no gamma. Forward-only, so there is no backward kernel.
+    """
+    b = cuda.blockIdx.y
+    t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    i_min = max(0, p - (M - 1))
+    i_max = min(N - 1, p)
+    diag_len = i_max - i_min + 1
+    if t >= diag_len:
+        return
+
+    i = i_min + t
+    j = p - i
+
+    # Out-of-band cells must still write +inf: their slot is reused every 3
+    # diagonals and may be read (by index) from a later in-band diagonal.
+    if bandwidth > 0 and abs(i - j) > bandwidth:
+        curr[b, i] = math.inf
+        return
+
+    # cost = ||X[b,i,:] - Y[b,j,:]||^2  (on the fly; no (N,M) cost tensor)
+    cost = 0.0
+    for k in range(D):
+        diff = X[b, i, k] - Y[b, j, k]
+        cost += diff * diff
+
+    # min over the three predecessors; the (0,0) corner is seeded with 0. Reads
+    # are guarded by predecessor validity, so only written slots are ever read.
+    if i == 0 and j == 0:
+        m = 0.0
+    else:
+        m = math.inf
+        if i - 1 >= 0 and j - 1 >= 0:      # (i-1, j-1) on diagonal p-2
+            v = prev2[b, i - 1]
+            if v < m: m = v
+        if i - 1 >= 0:                      # (i-1, j)   on diagonal p-1
+            v = prev1[b, i - 1]
+            if v < m: m = v
+        if j - 1 >= 0:                      # (i, j-1)   on diagonal p-1
+            v = prev1[b, i]
+            if v < m: m = v
+
+    curr[b, i] = cost + m
+
+
+@cuda.jit
 def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth, N, M, D, p):
     b = cuda.blockIdx.y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
@@ -63,12 +118,16 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
     ip = i + 1
     jp = j + 1
 
+    # Demote unreachable / out-of-band cells (R == +inf) to -inf *before* the
+    # bandwidth prune, so that in-band neighbours reading them contribute
+    # exp(-inf)=0 instead of producing (-inf)+(+inf)=NaN in the log-space sum.
+    if math.isinf(R[b, ip, jp]):
+        R[b, ip, jp] = -math.inf
+
     if bandwidth > 0 and abs(i - j) > bandwidth:
         return
 
     Rij = R[b, ip, jp]
-    if math.isinf(Rij):
-        Rij = -math.inf
 
     # costs for transitions:
     # D_pad[ip+1, jp]   corresponds to ||X[i+1] - Y[j]||^2
@@ -187,31 +246,39 @@ def softdtw_forward_diag_cuda(D, R, gamma, bandwidth, N, M, p):
     R[b, ip, jp] = D[b, i, j] + softmin
 
 
-
 @cuda.jit
-def softdtw_backward_kernel_legacy(D_pad, R, inv_gamma, bandwidth, max_i, max_j, n_passes, E):
-    b = cuda.blockIdx.x
-    tid = cuda.threadIdx.x
-    I = tid
+def dtw_forward_diag_cuda(D, R, bandwidth, N, M, p):
+    """D-based forward for *hard* DTW (min recurrence, no gamma). Forward-only."""
+    b = cuda.blockIdx.y
+    t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
 
-    for p in range(n_passes):
-        rev_p = n_passes - p - 1
-        J = max(0, min(rev_p - tid, max_j - 1))
+    i_min = max(0, p - (M - 1))
+    i_max = min(N - 1, p)
 
-        i = I + 1
-        j = J + 1
+    diag_len = i_max - i_min + 1
+    if t >= diag_len:
+        return
 
-        if I + J == rev_p and (I < max_i and J < max_j):
-            if math.isinf(R[b, i, j]):
-                R[b, i, j] = -math.inf
+    i = i_min + t
+    j = p - i
 
-            if not (abs(i - j) > bandwidth > 0):
-                # NOTE: this is the baseline (numerically unsafe). We'll replace with stabilized/log-space soon.
-                a = math.exp((R[b, i + 1, j] - R[b, i, j] - D_pad[b, i + 1, j]) * inv_gamma)
-                bb = math.exp((R[b, i, j + 1] - R[b, i, j] - D_pad[b, i, j + 1]) * inv_gamma)
-                c = math.exp((R[b, i + 1, j + 1] - R[b, i, j] - D_pad[b, i + 1, j + 1]) * inv_gamma)
-                E[b, i, j] = E[b, i + 1, j] * a + E[b, i, j + 1] * bb + E[b, i + 1, j + 1] * c
-        cuda.syncthreads()
+    ip = i + 1
+    jp = j + 1
+
+    if bandwidth > 0 and abs(ip - jp) > bandwidth:
+        return
+
+    r0 = R[b, ip - 1, jp - 1]
+    r1 = R[b, ip - 1, jp]
+    r2 = R[b, ip,     jp - 1]
+
+    m = r0
+    if r1 < m: m = r1
+    if r2 < m: m = r2
+
+    R[b, ip, jp] = D[b, i, j] + m
+
+
 
 @cuda.jit(device=True, inline=True)
 def _logsumexp3(a, b, c):
@@ -244,12 +311,16 @@ def softdtw_backward_log_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes
 
         if I + J == rev_p and (I < max_i and J < max_j):
 
+            # Demote unreachable / out-of-band cells (R == +inf) to -inf *before*
+            # the bandwidth prune, so in-band neighbours reading them contribute
+            # exp(-inf)=0 rather than (-inf)+(+inf)=NaN in the log-space sum.
+            if math.isinf(R[k, i, j]):
+                R[k, i, j] = -math.inf
+
             # pruning
             if not (abs(i - j) > bandwidth > 0):
 
                 Rij = R[k, i, j]
-                if math.isinf(Rij):
-                    Rij = -math.inf
 
                 # log transition weights (no exp here!)
                 la = (R[k, i + 1, j]     - Rij - D[k, i + 1, j])     * inv_gamma
@@ -281,13 +352,17 @@ def softdtw_backward_log_diag_cuda(Dp, R, logE, inv_gamma, bandwidth, N, M, p):
     ip = i + 1
     jp = j + 1
 
+    # Demote unreachable / out-of-band cells (R == +inf) to -inf *before* the
+    # bandwidth prune (see softdtw_backward_log_cuda) to avoid (-inf)+(+inf)=NaN
+    # in the log-space accumulation of in-band neighbours.
+    if math.isinf(R[b, ip, jp]):
+        R[b, ip, jp] = -math.inf
+
     # pruning
     if bandwidth > 0 and abs(i - j) > bandwidth:
         return
 
     Rij = R[b, ip, jp]
-    if math.isinf(Rij):
-        Rij = -math.inf
 
     la = (R[b, ip + 1, jp]     - Rij - Dp[b, ip + 1, jp])     * inv_gamma
     lb = (R[b, ip, jp + 1]     - Rij - Dp[b, ip, jp + 1])     * inv_gamma

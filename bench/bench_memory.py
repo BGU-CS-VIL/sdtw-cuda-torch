@@ -138,10 +138,10 @@ def _plot_metric(ax, xs, results_list, metric_key, xlabel, ylabel, title, nan_la
         ax.plot(xs, ys, label=disp, color=COLORS[label], marker=MARKERS[label],
                 linewidth=1.8, markersize=6)
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend(fontsize=8)
+    ax.set_xlabel(xlabel, fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+    ax.set_title(title, fontsize=16)
+    ax.legend(fontsize=12)
     ax.grid(True, linestyle="--", alpha=0.4)
 
 
@@ -212,7 +212,7 @@ def main():
     Ds = [cfg[2] for cfg in vary_D_grid]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    fig.suptitle("SoftDTW Benchmark  (B = 32)", fontsize=13, fontweight="bold")
+    #fig.suptitle("SoftDTW Benchmark  (B = 32)", fontsize=13, fontweight="bold")
 
     # Row 0 – Peak GPU RAM
     _plot_metric(
@@ -249,7 +249,7 @@ def main():
     )
 
     plt.tight_layout()
-    out_plot = os.path.join(HERE, "benchmark_plots.png")
+    out_plot = os.path.join(HERE, "benchmark_plots.pdf")
     plt.savefig(out_plot, dpi=150, bbox_inches="tight")
     print(f"Saved plots to:   {out_plot}")
     plt.close()

@@ -1,0 +1,25 @@
+# Conda environment for softdtw-cuda-torch (development, benchmarks, examples).
+#
+# The package is pure Python + Numba-JIT CUDA kernels (no compiled extension), so
+# `pip install -e .` is enough on any platform that has a CUDA-enabled PyTorch. This
+# file is a convenience that also pulls the benchmark/example/test extras.
+#
+# CUDA notes:
+#   * Numba's CUDA PTX path requires a CUDA toolkit <= 12.6 (12.7+ currently breaks
+#     Numba). Numba needs libNVVM at runtime — provide it via a system CUDA toolkit
+#     (module/`CUDA_HOME`) or conda `cuda-nvcc`/`cuda-nvrtc` (<= 12.6).
+#   * Install a PyTorch build whose CUDA matches your driver, e.g.:
+#       pip install torch --index-url https://download.pytorch.org/whl/cu126
+name: sdtw-cuda-torch
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch>=2.0
+      - numba>=0.60
+      - numpy>=1.24
+      - matplotlib>=3.7   # benchmarks / examples
+      - pandas>=2.0        # benchmarks
+      - pytest>=7          # tests
